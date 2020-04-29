@@ -1,13 +1,21 @@
 package store
 
 import (
+	"bytes"
+	"encoding/gob"
 	"log"
 
 	"github.com/dgraph-io/badger"
+	"github.com/google/uuid"
 )
 
 type Store struct {
 	db *badger.DB
+}
+
+type Value struct {
+	Value   []byte
+	Version uuid.UUID
 }
 
 func NewStore(dbPath string) *Store {
@@ -26,15 +34,51 @@ func (s *Store) Close() {
 	s.db.Close()
 }
 
-func (s *Store) Set(key, value []byte) bool {
-	err := s.db.Update(func(txn *badger.Txn) error {
-		err := txn.Set(key, value)
+func (s *Store) MakeValue(value []byte) Value {
+	u, _ := uuid.NewUUID()
+	return Value{Version: u, Value: value}
+}
 
-		if err != nil {
-			return err
+func (s *Store) Set(key []byte, value Value) bool {
+	var valueBuffer bytes.Buffer
+
+	enc := gob.NewEncoder(&valueBuffer)
+	err := enc.Encode(value)
+
+	err = s.db.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
+
+		if err == nil {
+			var oldValue Value
+			valCopy, err := item.ValueCopy(nil)
+
+			if err != nil {
+				return err
+			}
+
+			buf := bytes.NewBuffer(valCopy)
+			dec := gob.NewDecoder(buf)
+			err = dec.Decode(&oldValue)
+
+			if err != nil {
+				return err
+			}
+			if oldValue.Version.Time() < value.Version.Time() {
+				err = txn.Set(key, valueBuffer.Bytes())
+
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			err = txn.Set(key, valueBuffer.Bytes())
+
+			if err != nil {
+				return err
+			}
 		}
 
-		return err
+		return nil
 	})
 
 	if err != nil {
@@ -44,8 +88,8 @@ func (s *Store) Set(key, value []byte) bool {
 	return true
 }
 
-func (s *Store) Get(key []byte) ([]byte, bool) {
-	var valCopy []byte
+func (s *Store) Get(key []byte) (Value, bool) {
+	var value Value
 
 	err := s.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(key)
@@ -53,7 +97,15 @@ func (s *Store) Get(key []byte) ([]byte, bool) {
 			return err
 		}
 
-		valCopy, err = item.ValueCopy(nil)
+		valCopy, err := item.ValueCopy(nil)
+		if err != nil {
+			return err
+		}
+
+		buf := bytes.NewBuffer(valCopy)
+		dec := gob.NewDecoder(buf)
+		err = dec.Decode(&value)
+
 		if err != nil {
 			return err
 		}
@@ -62,18 +114,47 @@ func (s *Store) Get(key []byte) ([]byte, bool) {
 	})
 
 	if err != nil {
-		return valCopy, false
+		return value, false
 	}
 
-	return valCopy, true
+	return value, true
 }
 
-func (s *Store) Delete(key []byte) bool {
+func (s *Store) Delete(key []byte, value Value) bool {
 	err := s.db.Update(func(txn *badger.Txn) error {
-		err := txn.Delete(key)
+		item, err := txn.Get(key)
 
-		if err != nil {
-			return err
+		if err == nil {
+			var oldValue Value
+			valCopy, err := item.ValueCopy(nil)
+
+			if err != nil {
+				return err
+			}
+
+			buf := bytes.NewBuffer(valCopy)
+			dec := gob.NewDecoder(buf)
+			err = dec.Decode(&oldValue)
+
+			if err != nil {
+				return err
+			}
+
+			if oldValue.Version.Time() < value.Version.Time() {
+				err := txn.Delete(key)
+
+				if err != nil {
+					return err
+				}
+			}
+
+		} else {
+
+			err := txn.Delete(key)
+
+			if err != nil {
+				return err
+			}
 		}
 
 		return err
